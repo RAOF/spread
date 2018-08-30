@@ -2,7 +2,6 @@ package spread
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +9,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	// used instead of just importing "context" for compatibility
+	// with go1.6 which is used in the xenial autopkgtests
+	"golang.org/x/net/context"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/terminal"
@@ -82,37 +85,45 @@ func (c *Client) dialOnReboot(prevUptime time.Time) error {
 	uptimeChanged := 3 * time.Second
 
 	for {
-		before := time.Now()
+		// Try to connect to the rebooting system, note that
+		// waitConfig is not well honored by golang, it is
+		// set to 5sec above but in reality it takes ~60sec
+		// before the code times out.
 		sshc, err := ssh.Dial("tcp", c.addr, &waitConfig)
-		if err != nil {
-			// It's gone.
-			continue
+		if err == nil {
+			// once successfully connected, check uptime to
+			// see if the reboot actually happend
+			c.sshc.Close()
+			c.sshc = sshc
+			currUptime, err := c.getUptime()
+			if err == nil {
+				uptimeDelta := currUptime.Sub(prevUptime)
+				if uptimeDelta > uptimeChanged {
+					// Reboot done
+					return nil
+				}
+			}
 		}
 
-		c.sshc.Close()
-		c.sshc = sshc
-		currUptime, err := c.getUptime()
-		if err != nil {
-			// Not available uptime yet
-			continue
-		}
-
-		uptimeDelta := currUptime.Sub(prevUptime)
-		if  uptimeDelta > uptimeChanged {
-			// Reboot done
-			return nil
-		}
-		// Dial was observed not respecting the timeout by a long shot. Enforce it.
-		if time.Now().After(before.Add(waitConfig.Timeout)) {
-			break
-		}
-
+		// Use multiple selects to ensure that the channels get
+		// checked in the right order. If a single select is used
+		// and all channels have data golang will pick a random
+		// channel. This means that on timeout there is a 1/2 chance
+		// that there is also a retry and ssh.Dial() is run again
+		// which needs to timeout first before the channels are
+		// checked again.
 		select {
-		case <-retry.C:
-		case <-relog.C:
-			printf("Reboot on %s is taking a while...", c.job)
 		case <-timeout:
 			return fmt.Errorf("kill-timeout reached after %s reboot request", c.job)
+		default:
+		}
+		select {
+		case <-relog.C:
+			printf("Reboot on %s is taking a while...", c.job)
+		default:
+		}
+		select {
+		case <-retry.C:
 		}
 	}
 
@@ -286,7 +297,6 @@ func (c *Client) run(script string, dir string, env *Environment, mode outputMod
 			return nil, err
 		}
 		c.Run("reboot", "", nil)
-		time.Sleep(3 * time.Second)
 
 		if err := c.dialOnReboot(uptime); err != nil {
 			return nil, err
@@ -351,7 +361,11 @@ func (c *Client) runPart(script string, dir string, env *Environment, mode outpu
 	}
 	buf.WriteString(rc(false, "REBOOT() { { set +xu; } 2> /dev/null; [ -z \"$1\" ] && echo '<REBOOT>' || echo \"<REBOOT $1>\"; exit 213; }\n"))
 	buf.WriteString(rc(false, "ERROR() { { set +xu; } 2> /dev/null; [ -z \"$1\" ] && echo '<ERROR>' || echo \"<ERROR $@>\"; exit 213; }\n"))
-	buf.WriteString(rc(true, "MATCH() { { set +xu; } 2> /dev/null; [ ${#@} -gt 0 ] || { echo \"error: missing regexp argument\"; return 1; }; local stdin=\"$(cat)\"; echo \"$stdin\" | grep -q -E \"$@\" || { echo \"error: pattern not found, got:\n$stdin\">&2; return 1; }; }\n"))
+	// We are not using pipes here, see:
+	//  https://github.com/snapcore/spread/pull/64
+	// We also run it in a subshell, see
+	//  https://github.com/snapcore/spread/pull/67
+	buf.WriteString(rc(true, "MATCH() ( { set +xu; } 2> /dev/null; [ ${#@} -gt 0 ] || { echo \"error: missing regexp argument\"; return 1; }; local stdin=\"$(cat)\"; grep -q -E \"$@\" <<< \"$stdin\" || { res=$?; echo \"grep error: pattern not found, got:\n$stdin\">&2; if [ $res != 1 ]; then echo \"unexpected grep exit status: $res\"; fi; return 1; }; )\n"))
 	buf.WriteString("export DEBIAN_FRONTEND=noninteractive\n")
 	buf.WriteString("export DEBIAN_PRIORITY=critical\n")
 	buf.WriteString("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin\n")
@@ -507,7 +521,7 @@ func (c *Client) SetupRootAccess(password string) error {
 		script = fmt.Sprintf(`echo root:'%s' | chpasswd`, password)
 	} else {
 		script = strings.Join([]string{
-			`sudo sed -i 's/\(PermitRootLogin\|PasswordAuthentication\)\>.*/\1 yes/' /etc/ssh/sshd_config`,
+			`sudo sed -i 's/^\s*#\?\s*\(PermitRootLogin\|PasswordAuthentication\)\>.*/\1 yes/' /etc/ssh/sshd_config`,
 			`echo root:'` + password + `' | sudo chpasswd`,
 			`sudo pkill -o -HUP sshd || true`,
 		}, "\n")
@@ -1023,6 +1037,33 @@ func waitPortUp(ctx context.Context, what fmt.Stringer, address string) error {
 			return fmt.Errorf("cannot connect to %s: %v", what, err)
 		case <-ctx.Done():
 			return fmt.Errorf("cannot connect to %s: interrupted", what)
+		}
+	}
+	return nil
+}
+
+func waitServerUp(ctx context.Context, server Server, username, password string) error {
+	var timeout = time.After(5 * time.Minute)
+	var relog = time.NewTicker(2 * time.Minute)
+	defer relog.Stop()
+	var retry = time.NewTicker(1 * time.Second)
+	defer retry.Stop()
+
+	for {
+		debugf("Waiting until %s is listening...", server)
+		client, err := Dial(server, username, password)
+		if err == nil {
+			client.Close()
+			break
+		}
+		select {
+		case <-retry.C:
+		case <-relog.C:
+			printf("Cannot connect to %s: %v", server, err)
+		case <-timeout:
+			return fmt.Errorf("cannot connect to %s: %v", server, err)
+		case <-ctx.Done():
+			return fmt.Errorf("cannot connect to %s: interrupted", server)
 		}
 	}
 	return nil

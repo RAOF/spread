@@ -514,7 +514,7 @@ func Load(path string) (*Project, error) {
 			backend.Type = bname
 		}
 		switch backend.Type {
-		case "google", "linode", "lxd", "qemu", "adhoc":
+		case "google", "linode", "lxd", "qemu", "adhoc", "humbox":
 		default:
 			return nil, fmt.Errorf("%s has unsupported type %q", backend, backend.Type)
 		}
@@ -1287,6 +1287,10 @@ func (s *Size) UnmarshalYAML(u func(interface{}) error) error {
 	_ = u(&str)
 	if len(str) == 0 {
 		*s = 0
+		return nil
+	}
+	if str == "preserve-size" {
+		*s = -1
 		return nil
 	}
 	n, err := strconv.Atoi(str[:len(str)-1])

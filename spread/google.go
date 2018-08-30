@@ -21,6 +21,7 @@ import (
 	"github.com/niemeyer/pretty"
 	"regexp"
 	"strconv"
+	"unicode"
 )
 
 func Google(p *Project, b *Backend, o *Options) Provider {
@@ -64,6 +65,8 @@ type googleServerData struct {
 	Plan    string    `json:"machineType"`
 	Status  string    `yaml:"-"`
 	Created time.Time `json:"creationTimestamp"`
+
+	Labels map[string]string `yaml:"-"`
 }
 
 func (d *googleServerData) cleanup() {
@@ -147,10 +150,6 @@ func (s *googleServer) Discard(ctx context.Context) error {
 	return s.p.removeMachine(ctx, s)
 }
 
-func (p *googleProvider) GarbageCollect() error {
-	return nil
-}
-
 const googleStartupScript = `
 echo root:%s | chpasswd
 
@@ -163,9 +162,10 @@ echo '` + googleReadyMarker + `' > /dev/ttyS2
 
 const googleReadyMarker = "MACHINE-IS-READY"
 const googleNameLayout = "Jan021504.000000"
+const googleDefaultPlan = "n1-standard-1"
 
 func googleName() string {
-	return strings.ToLower(strings.Replace(time.Now().Format(googleNameLayout), ".", "-", 1))
+	return strings.ToLower(strings.Replace(time.Now().UTC().Format(googleNameLayout), ".", "-", 1))
 }
 
 func googleParseName(name string) (time.Time, error) {
@@ -382,14 +382,9 @@ func (p *googleProvider) createMachine(ctx context.Context, system *System) (*go
 	debugf("Creating new Google server for %s...", system.Name)
 
 	name := googleName()
-	plan := "n1-standard-1"
+	plan := googleDefaultPlan
 	if p.backend.Plan != "" {
 		plan = p.backend.Plan
-	}
-
-	storage := 10
-	if p.backend.Storage > 0 {
-		storage = int(p.backend.Storage / gb)
 	}
 
 	image, family, err := p.image(system)
@@ -428,6 +423,15 @@ func (p *googleProvider) createMachine(ctx context.Context, system *System) (*go
 		})
 	}
 
+	diskParams := googleParams{
+		"sourceImage": sourceImage,
+	}
+	if p.backend.Storage == 0 {
+		diskParams["diskSizeGb"] = 10
+	} else if p.backend.Storage > 0 {
+		diskParams["diskSizeGb"] = int(p.backend.Storage / gb)
+	}
+
 	params := googleParams{
 		"name":        name,
 		"machineType": "zones/" + p.gzone() + "/machineTypes/" + plan,
@@ -439,19 +443,13 @@ func (p *googleProvider) createMachine(ctx context.Context, system *System) (*go
 			"network": "global/networks/default",
 		}},
 		"disks": []googleParams{{
-			"autoDelete": "true",
-			"boot":       "true",
-			"type":       "PERSISTENT",
-			"initializeParams": googleParams{
-				"sourceImage": sourceImage,
-				"diskSizeGb": storage,
-			},
+			"autoDelete":       "true",
+			"boot":             "true",
+			"type":             "PERSISTENT",
+			"initializeParams": diskParams,
 		}},
 		"metadata": googleParams{
-			"items": []googleParams{{
-				"key":   "startup-script",
-				"value": fmt.Sprintf(googleStartupScript, p.options.Password),
-			}},
+			"items": metadata,
 		},
 		"labels": labels,
 		"tags": googleParams{
@@ -590,6 +588,36 @@ func (p *googleProvider) setMetadata(s *googleServer, meta *googleInstanceMetada
 	return nil
 }
 
+type googleListResult struct {
+	Items []googleServerData
+}
+
+var googleLabelWarning = true
+
+func (p *googleProvider) list() ([]*googleServer, error) {
+	debug("Listing available Google servers...")
+
+	var result googleListResult
+	err := p.doz("GET", "/instances", nil, &result)
+	if err != nil {
+		return nil, fmt.Errorf("cannot get instances list: %v", err)
+	}
+
+	servers := make([]*googleServer, 0, len(result.Items))
+	for _, d := range result.Items {
+		if _, err := googleParseName(d.Name); err != nil {
+			if googleLabelWarning {
+				googleLabelWarning = false
+				printf("WARNING: Some Google servers ignored due to unsafe labels.")
+			}
+			continue
+		}
+		servers = append(servers, &googleServer{p: p, d: d})
+	}
+
+	return servers, nil
+}
+
 func (p *googleProvider) removeMachine(ctx context.Context, s *googleServer) error {
 	if err := p.checkLabel(s); err != nil {
 		return fmt.Errorf("cannot deallocate Google server %s: %v", s, err)
@@ -603,6 +631,45 @@ func (p *googleProvider) removeMachine(ctx context.Context, s *googleServer) err
 
 	//_, err = p.waitOperation(ctx, s, "deallocate", op.Name)
 	return err
+}
+
+func (p *googleProvider) GarbageCollect() error {
+	servers, err := p.list()
+	if err != nil {
+		return err
+	}
+
+	now := time.Now()
+	haltTimeout := p.backend.HaltTimeout.Duration
+
+	// Iterate over all the running instances
+	for _, s := range servers {
+		serverTimeout := haltTimeout
+		if value, ok := s.d.Labels["halt-timeout"]; ok {
+			d, err := time.ParseDuration(strings.TrimSpace(value))
+			if err != nil {
+				printf("WARNING: Ignoring bad Google server %s halt-timeout label: %q", s, value)
+			} else {
+				serverTimeout = d
+			}
+		}
+
+		if serverTimeout == 0 {
+			continue
+		}
+
+		printf("Checking %s...", s)
+
+		runningTime := now.Sub(s.d.Created)
+		if runningTime > serverTimeout {
+			printf("Server %s exceeds halt-timeout. Shutting it down...", s)
+			err := p.removeMachine(context.Background(), s)
+			if err != nil {
+				printf("WARNING: Cannot garbage collect %s: %v", s, err)
+			}
+		}
+	}
+	return nil
 }
 
 type googleOperation struct {
@@ -741,7 +808,10 @@ const googleScope = "https://www.googleapis.com/auth/cloud-platform"
 type googleResult struct {
 	Kind  string
 	Error struct {
-		Errors []googleError
+		Code    int
+		Message string
+		Status  string
+		Errors  []googleError
 	}
 }
 
@@ -751,9 +821,29 @@ type googleError struct {
 	Message string
 }
 
+func polishErrorMessage(msg string) string {
+	if len(msg) > 2 {
+		if unicode.IsUpper(rune(msg[0])) && unicode.IsLower(rune(msg[1])) {
+			msg = strings.ToLower(string(msg[0])) + msg[1:]
+		}
+		if msg[len(msg)-1] == '.' && unicode.IsLetter(rune(msg[len(msg)-2])) {
+			msg = msg[:len(msg)-1]
+		}
+	}
+	return msg
+}
+
 func (r *googleResult) err() error {
-	for _, e := range r.Error.Errors {
-		return fmt.Errorf("%s", strings.ToLower(string(e.Message[0]))+e.Message[1:])
+	if r.Error.Code != 0 || r.Error.Message != "" || len(r.Error.Errors) > 0 {
+		if r.Error.Message != "" {
+			return fmt.Errorf("%s", polishErrorMessage(r.Error.Message))
+		}
+		for _, e := range r.Error.Errors {
+			if e.Message != "" {
+				return fmt.Errorf("%s", polishErrorMessage(e.Message))
+			}
+		}
+		return fmt.Errorf("malformed Google error (code %d, status %q)", r.Error.Code, r.Error.Status)
 	}
 	return nil
 }
@@ -798,14 +888,15 @@ func (p *googleProvider) dofl(method, subpath string, params interface{}, result
 
 	<-googleThrottle
 
-	url := "https://www.googleapis.com/"
+	url := "https://www.googleapis.com"
 	if flags&noPathPrefix == 0 {
 		url += "/compute/v1/projects/" + p.gproject() + subpath
 	} else {
 		url += subpath
 	}
 
-	// Repeat on 500s. Comes from Linode logic, not observed on Google so far.
+	// Repeat on 500s. Note that Google's 500s may come in late, as a marshaled error
+	// under a different code. See the INTERNAL handling at the end below.
 	var resp *http.Response
 	var req *http.Request
 	var delays = rand.Perm(10)
@@ -821,38 +912,47 @@ func (p *googleProvider) dofl(method, subpath string, params interface{}, result
 			time.Sleep(time.Duration(delays[i]) * 250 * time.Millisecond)
 			continue
 		}
+
+		if err != nil {
+			return fmt.Errorf("cannot perform Google request: %v", err)
+		}
+
+		data, err = ungzip(ioutil.ReadAll(resp.Body))
+		resp.Body.Close()
+		if err != nil {
+			return fmt.Errorf("cannot read Google response: %v", err)
+		}
+
+		if log && Debug {
+			var r interface{}
+			if err := json.Unmarshal(data, &r); err == nil {
+				debugf("Google response: %# v\n", r)
+			}
+		}
+
+		if result != nil {
+			// Unmarshal even on errors, so the call site has a chance to inspect the data on errors.
+			err = json.Unmarshal(data, result)
+			if err != nil && resp.StatusCode == 404 {
+				return googleNotFound
+			}
+		}
+
+		var eresult googleResult
+		if jerr := json.Unmarshal(data, &eresult); jerr == nil {
+			if eresult.Error.Status == "INTERNAL" && eresult.Error.Code == 500 {
+				// Google has broken down like this before:
+				// https://paste.ubuntu.com/p/HMvvxNMq9G/
+				if i == 0 {
+					printf("Google internal error on %s. Retrying a few times...", subpath)
+				}
+				continue
+			}
+			if rerr := eresult.err(); rerr != nil {
+				return rerr
+			}
+		}
 		break
-	}
-	if err != nil {
-		return fmt.Errorf("cannot perform Google request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	data, err = ungzip(ioutil.ReadAll(resp.Body))
-	if err != nil {
-		return fmt.Errorf("cannot read Google response: %v", err)
-	}
-
-	if log && Debug {
-		var r interface{}
-		if err := json.Unmarshal(data, &r); err == nil {
-			debugf("Google response: %# v\n", r)
-		}
-	}
-
-	if result != nil {
-		// Unmarshal even on errors, so the call site has a chance to inspect the data on errors.
-		err = json.Unmarshal(data, result)
-		if err != nil && resp.StatusCode == 404 {
-			return googleNotFound
-		}
-	}
-
-	var eresult googleResult
-	if jerr := json.Unmarshal(data, &eresult); jerr == nil {
-		if rerr := eresult.err(); rerr != nil {
-			return rerr
-		}
 	}
 
 	if err != nil {
